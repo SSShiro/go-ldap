@@ -2,3 +2,7 @@ examples/modify
 examples/search
 examples/searchSSL
 examples/searchTLS
+
+# local credentials (do not commit)
+ldap.env
+*.env
