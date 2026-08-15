@@ -1,7 +1,9 @@
 package ldap
 
 import (
+	"bytes"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -10,6 +12,57 @@ import (
 
 	"github.com/nmcclain/asn1-ber"
 )
+
+// MaxMessageSize bounds the declared length of a single inbound LDAP message.
+// A client fully controls the BER length field; without a cap, the underlying
+// asn1-ber parser allocates a buffer of that size before reading any content,
+// so a tiny packet declaring a huge length either panics the process
+// (integer-overflow in make) or exhausts memory. 16 MiB is well above any
+// legitimate LDAP request (larger than AD's own default receive buffer) while
+// bounding the damage of a malicious length. It is a var so an embedder can
+// tune it.
+var MaxMessageSize int64 = 16 << 20
+
+// readLimitedPacket reads one BER packet, rejecting it before allocation if its
+// declared length exceeds max. It inspects the length header itself, then
+// replays the consumed header into the real parser bounded by an io.LimitReader,
+// so the parser can never allocate or read more than max bytes of content.
+func readLimitedPacket(conn net.Conn, max int64) (*ber.Packet, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return nil, err // io.EOF here means a clean client close
+	}
+
+	var contentLen int64
+	prefix := header
+	if header[1]&0x80 != 0 {
+		n := int(header[1] & 0x7f)
+		if n == 0 || n > 8 {
+			// n==0 is the reserved indefinite form (not valid for LDAP);
+			// n>8 cannot fit in int64 and is always absurd for a message length.
+			return nil, fmt.Errorf("ber: invalid length field (%d octets)", n)
+		}
+		lenBytes := make([]byte, n)
+		if _, err := io.ReadFull(conn, lenBytes); err != nil {
+			return nil, err
+		}
+		for _, b := range lenBytes {
+			contentLen = contentLen<<8 | int64(b)
+			if contentLen > max {
+				return nil, fmt.Errorf("ber: message length exceeds limit of %d bytes", max)
+			}
+		}
+		prefix = append(header, lenBytes...)
+	} else {
+		contentLen = int64(header[1])
+	}
+
+	if contentLen > max {
+		return nil, fmt.Errorf("ber: message length %d exceeds limit of %d bytes", contentLen, max)
+	}
+
+	return ber.ReadPacket(io.MultiReader(bytes.NewReader(prefix), io.LimitReader(conn, contentLen)))
+}
 
 type Binder interface {
 	Bind(bindDN, bindSimplePw string, conn net.Conn) (LDAPResultCode, error)
@@ -225,10 +278,24 @@ listener:
 func (server *Server) handleConnection(conn net.Conn) {
 	boundDN := "" // "" == anonymous
 
+	// A panic while handling one connection (e.g. a malformed packet that trips
+	// a parser bug) must never take down the whole server process. Recover here
+	// and still run the per-connection cleanup so the descriptor and any tracked
+	// state are released exactly once.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("handleConnection: recovered from panic: %v", r)
+		}
+		for _, c := range server.CloseFns {
+			c.Close(boundDN, conn)
+		}
+		conn.Close()
+	}()
+
 handler:
 	for {
 		// read incoming LDAP packet
-		packet, err := ber.ReadPacket(conn)
+		packet, err := readLimitedPacket(conn, MaxMessageSize)
 		if err == io.EOF { // Client closed connection
 			break
 		} else if err != nil {
@@ -282,6 +349,10 @@ handler:
 					log.Printf("Malformed Bind DN")
 					break handler
 				}
+			} else {
+				// A failed bind reverts the connection to the anonymous state
+				// (RFC 4511 §4.2.1); it must not keep a previously bound identity.
+				boundDN = ""
 			}
 			responsePacket := encodeBindResponse(messageID, ldapResultCode)
 			if err = sendPacket(conn, responsePacket); err != nil {
@@ -290,19 +361,19 @@ handler:
 			}
 		case ApplicationSearchRequest:
 			server.Stats.countSearches(1)
-			if err := HandleSearchRequest(req, &controls, messageID, boundDN, server, conn); err != nil {
-				log.Printf("handleSearchRequest error %s", err.Error()) // TODO: make this more testable/better err handling - stop using log, stop using breaks?
-				e := err.(*Error)
-				if err = sendPacket(conn, encodeSearchDone(messageID, e.ResultCode)); err != nil {
-					log.Printf("sendPacket error %s", err.Error())
-					break handler
-				}
+			// An authoritative non-success result (e.g. noSuchObject) is a normal
+			// answer, not a transport failure: send searchDone with its code and
+			// keep the connection open. Only a failure to WRITE the response is
+			// terminal — pooled/long-lived clients must not have their connection
+			// dropped after every failed search.
+			var resultCode LDAPResultCode = LDAPResultSuccess
+			if serr := HandleSearchRequest(req, &controls, messageID, boundDN, server, conn); serr != nil {
+				log.Printf("handleSearchRequest error %s", serr.Error())
+				resultCode = serr.(*Error).ResultCode
+			}
+			if err = sendPacket(conn, encodeSearchDone(messageID, resultCode)); err != nil {
+				log.Printf("sendPacket error %s", err.Error())
 				break handler
-			} else {
-				if err = sendPacket(conn, encodeSearchDone(messageID, LDAPResultSuccess)); err != nil {
-					log.Printf("sendPacket error %s", err.Error())
-					break handler
-				}
 			}
 		case ApplicationUnbindRequest:
 			server.Stats.countUnbinds(1)
@@ -355,12 +426,8 @@ handler:
 			}
 		}
 	}
-
-	for _, c := range server.CloseFns {
-		c.Close(boundDN, conn)
-	}
-
-	conn.Close()
+	// Cleanup (CloseFns + conn.Close) runs in the deferred function above so it
+	// happens exactly once, including on a recovered panic.
 }
 
 //
