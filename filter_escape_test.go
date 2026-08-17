@@ -93,3 +93,21 @@ func TestDecompileFilterKeepsPrintable(t *testing.T) {
 		t.Fatalf("printable value changed: %q", got)
 	}
 }
+
+// An extensible match (filter [9], e.g. LDAP_MATCHING_RULE_IN_CHAIN) must be
+// rendered as "type:matchingRule:=value", not dropped as an empty "()".
+func TestDecompileFilterExtensibleMatch(t *testing.T) {
+	em := ber.Encode(ber.ClassContext, ber.TypeConstructed, FilterExtensibleMatch, nil, "em")
+	em.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimitive, MatchingRuleAssertionMatchingRule, "1.2.840.113556.1.4.1941", "rule"))
+	em.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimitive, MatchingRuleAssertionType, "member", "type"))
+	em.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimitive, MatchingRuleAssertionMatchValue, "CN=Ivan Ivanov,OU=IT operation,OU=Example,DC=com", "value"))
+
+	got, err := DecompileFilter(em)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	want := `(member:1.2.840.113556.1.4.1941:=CN=Ivan Ivanov,OU=IT operation,OU=Example,DC=com)`
+	if got != want {
+		t.Fatalf("extensible match mismatch:\n got=%q\nwant=%q", got, want)
+	}
+}

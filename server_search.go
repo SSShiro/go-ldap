@@ -21,9 +21,17 @@ func HandleSearchRequest(req *ber.Packet, controls *[]Control, messageID uint64,
 		return NewError(LDAPResultOperationsError, err)
 	}
 
-	filterPacket, err := CompileFilter(searchReq.Filter)
-	if err != nil {
-		return NewError(LDAPResultOperationsError, err)
+	// The filter is only re-compiled for server-side enforcement (EnforceLDAP).
+	// A proxy that runs its own filtering on the backend keeps EnforceLDAP off,
+	// so it must not fail the whole search just because this library cannot
+	// compile a filter form it does not implement (e.g. an extensible match) —
+	// the decompiled string is forwarded to the real directory, which does.
+	var filterPacket *ber.Packet
+	if server.EnforceLDAP {
+		filterPacket, err = CompileFilter(searchReq.Filter)
+		if err != nil {
+			return NewError(LDAPResultOperationsError, err)
+		}
 	}
 
 	fnNames := []string{}

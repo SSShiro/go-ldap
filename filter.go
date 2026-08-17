@@ -43,6 +43,15 @@ const (
 	FilterSubstringsFinal   = 2
 )
 
+// Sub-component context tags of a MatchingRuleAssertion (extensible match,
+// filter [9]), per RFC 4511 §4.5.1.7.
+const (
+	MatchingRuleAssertionMatchingRule = 1
+	MatchingRuleAssertionType         = 2
+	MatchingRuleAssertionMatchValue   = 3
+	MatchingRuleAssertionDNAttributes = 4
+)
+
 func CompileFilter(filter string) (*ber.Packet, error) {
 	if len(filter) == 0 || filter[0] != '(' {
 		return nil, NewError(ErrorFilterCompile, errors.New("ldap: filter does not start with an '('"))
@@ -142,6 +151,37 @@ func DecompileFilter(packet *ber.Packet) (ret string, err error) {
 		ret += ber.DecodeString(packet.Children[0].Data.Bytes())
 		ret += "~="
 		ret += escapeFilterValue(packet.Children[1].Data.Bytes())
+	case FilterExtensibleMatch:
+		// MatchingRuleAssertion → "type[:dn][:matchingRule]:=value"
+		// (e.g. member:1.2.840.113556.1.4.1941:=CN=...). Without this case the
+		// assertion was dropped, leaving an empty "()" that failed to recompile.
+		attr := ""
+		matchingRule := ""
+		dnAttributes := false
+		var value []byte
+		for _, child := range packet.Children {
+			switch child.Tag {
+			case MatchingRuleAssertionMatchingRule:
+				matchingRule = ber.DecodeString(child.Data.Bytes())
+			case MatchingRuleAssertionType:
+				attr = ber.DecodeString(child.Data.Bytes())
+			case MatchingRuleAssertionMatchValue:
+				value = child.Data.Bytes()
+			case MatchingRuleAssertionDNAttributes:
+				if b, ok := child.Value.(bool); ok {
+					dnAttributes = b
+				}
+			}
+		}
+		ret += attr
+		if dnAttributes {
+			ret += ":dn"
+		}
+		if len(matchingRule) > 0 {
+			ret += ":" + matchingRule
+		}
+		ret += ":="
+		ret += escapeFilterValue(value)
 	}
 
 	ret += ")"
