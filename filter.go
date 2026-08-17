@@ -57,6 +57,24 @@ func CompileFilter(filter string) (*ber.Packet, error) {
 	return packet, nil
 }
 
+// escapeFilterValue renders an assertion value as an RFC 4515 filter string,
+// escaping every byte that would otherwise be misread: the filter metacharacters
+// ( ) * \ and NUL, plus any non-printable or high (>= 0x7f) byte. Without this a
+// binary value (e.g. an objectGUID) would be placed into the filter string as
+// raw bytes, producing an invalid, non-UTF-8 string that a downstream filter
+// compiler rejects.
+func escapeFilterValue(b []byte) string {
+	var sb strings.Builder
+	for _, c := range b {
+		if c == '(' || c == ')' || c == '*' || c == '\\' || c < 0x20 || c >= 0x7f {
+			fmt.Fprintf(&sb, "\\%02x", c)
+		} else {
+			sb.WriteByte(c)
+		}
+	}
+	return sb.String()
+}
+
 func DecompileFilter(packet *ber.Packet) (ret string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -99,31 +117,31 @@ func DecompileFilter(packet *ber.Packet) (ret string, err error) {
 		ret += "="
 		switch packet.Children[1].Children[0].Tag {
 		case FilterSubstringsInitial:
-			ret += ber.DecodeString(packet.Children[1].Children[0].Data.Bytes()) + "*"
+			ret += escapeFilterValue(packet.Children[1].Children[0].Data.Bytes()) + "*"
 		case FilterSubstringsAny:
-			ret += "*" + ber.DecodeString(packet.Children[1].Children[0].Data.Bytes()) + "*"
+			ret += "*" + escapeFilterValue(packet.Children[1].Children[0].Data.Bytes()) + "*"
 		case FilterSubstringsFinal:
-			ret += "*" + ber.DecodeString(packet.Children[1].Children[0].Data.Bytes())
+			ret += "*" + escapeFilterValue(packet.Children[1].Children[0].Data.Bytes())
 		}
 	case FilterEqualityMatch:
 		ret += ber.DecodeString(packet.Children[0].Data.Bytes())
 		ret += "="
-		ret += ber.DecodeString(packet.Children[1].Data.Bytes())
+		ret += escapeFilterValue(packet.Children[1].Data.Bytes())
 	case FilterGreaterOrEqual:
 		ret += ber.DecodeString(packet.Children[0].Data.Bytes())
 		ret += ">="
-		ret += ber.DecodeString(packet.Children[1].Data.Bytes())
+		ret += escapeFilterValue(packet.Children[1].Data.Bytes())
 	case FilterLessOrEqual:
 		ret += ber.DecodeString(packet.Children[0].Data.Bytes())
 		ret += "<="
-		ret += ber.DecodeString(packet.Children[1].Data.Bytes())
+		ret += escapeFilterValue(packet.Children[1].Data.Bytes())
 	case FilterPresent:
 		ret += ber.DecodeString(packet.Data.Bytes())
 		ret += "=*"
 	case FilterApproxMatch:
 		ret += ber.DecodeString(packet.Children[0].Data.Bytes())
 		ret += "~="
-		ret += ber.DecodeString(packet.Children[1].Data.Bytes())
+		ret += escapeFilterValue(packet.Children[1].Data.Bytes())
 	}
 
 	ret += ")"
